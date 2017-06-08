@@ -4,7 +4,7 @@ The intention of this project is to practice generalized linear regression skill
 ### Submission by Connor Lenio. Email: cojamalo@gmail.com
 Completion Date: June 8, 2017
 
-### Please visit  https://cojamalo.github.io/DATA-ADV-R-City-WX-Tables/Weather-Tables.html to properly view the project html file.
+### Please visit  https://cojamalo.github.io/DATA-PROJ-Neg-Binom-Reg/reg_model_project.html to properly view the project html file.
 
 
 ### Introduction to the Data
