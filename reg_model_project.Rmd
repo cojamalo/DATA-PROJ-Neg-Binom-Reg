@@ -1,0 +1,1059 @@
+---
+title: "Predicting the Number of Bikes Rented using Generalized Linear Regression Techniques"
+output: 
+  html_document: 
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+    toc: true
+---
+### Submission by Connor Lenio. Email: cojamalo@gmail.com
+Completion Date: Jun 8, 2017
+
+* * *
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.align='center', message = FALSE, warning=FALSE)
+if(!exists("klist", mode="function")) source("/Users/cojamalo/Documents/GitHub/K-Fold-CV-Helper-Functions/kfold.R")
+```
+
+
+## Goal
+The intention of this project is to practice generalized linear regression skills on real data using the Bike Sharing Demand competition on Kaggle. 
+
+* * *
+
+## Setup
+
+### Load packages
+
+```{r load-packages, message = FALSE}
+library(data.table)
+library(pander)
+library(ggplot2)
+library(GGally)
+library(gridExtra)
+library(lubridate)
+library(splines)
+library(doMC)
+library(MASS)
+library(foreach)
+library(parallel)
+library(caret)
+library(dplyr)
+```
+
+### Load data
+The data was downloaded from Kaggle at https://www.kaggle.com/c/bike-sharing-demand/data on Jun 1, 2017. For the sake of this project, a 75-25 split will be used to validate the model.
+```{r load-data}
+bike <- fread("train.csv", na.strings = "", showProgress = FALSE) %>% tbl_df
+bike_untrain <- bike
+set.seed(123)
+train <- sample_n(bike, size = nrow(bike) * 0.75)
+naive <- train
+test <- anti_join(bike, train)
+```
+
+This data set was provided by Hadi Fanaee Tork using data from Capital Bikeshare.
+
+* * *
+
+## Part 1: Data Background Information
+
+The original assignment from Kaggle:
+"You are provided hourly rental data spanning two years. For this competition, the training set is comprised of the first 19 days of each month, while the test set is the 20th to the end of the month. You must predict the total count of bikes rented during each hour by the test set, using only information available prior to the rental period."
+
+The `bikeshare` data set includes 10886 hourly periods that occurred between  January 2011 and January 2013 in the Capital Bikeshare program in Washington, DC. Each hourly period contains a summary of environmental information during that hour including the weather and temperature, as well as information about the type of users making the rentals, and the features of the time of year when the hourly period occurred. 
+
+
+* * *
+
+## Part 2: Machine Learning Target Outcome
+For this project, the desired outcome of the model will be to predict the total count of bikes rented in the hour. 
+
+<i>Performance benchmark:</i> The final model should have an RMSE less than 147.8 (number is derived from the naive linear model).
+
+<i>Relevance:</i> Predicting total bike rentals is useful for effectively managing the Capital Bikeshare system. Managers should ensure the maximum number of bikes are available to the system if demand is expected to be high. The more successful bike rentals that occur, the more efficient and profitable the system will be. Features of the date and time of the rental are known well beforehand, and weather information can be known over a week in advance to set management expectations for the system. 
+
+* * *
+
+## Part 3: Exploratory data analysis and feature engineering
+
+### Extraneous feature removal
+The `registered` and `casual` features are removed since these are subcategories of the response variable, `count`, and, thus, would not be knowable before the hourly period.
+```{r}
+train <- train %>% select(-registered, -casual)
+```
+
+<br>
+
+### Feature class changes and dummy variable design
+
+#### Convert `datetime` to a datetime class
+Convert the `datetime` variable from a character vector to a datetime variable.
+
+```{r clean-data-1}
+train$datetime <- ymd_hms(train$datetime)
+```
+
+<br>
+
+#### Create dummy variables in place of multi-level factors
+
+Convert multiple-category features to dummy variables for `season` and `weather`. The `table` function is used to make sure each category will have non-zero variability when split. All the categories except for the fourth category have sufficient variability. Using information from the codebook, this fourth category represents days with heavy precipitation. It will be combined with the third category to create a general precipitation category.
+```{r}
+table(train$season)
+table(train$weather)
+train <- train %>% mutate(spring = ifelse(season == 1, 1, 0), summer = ifelse(season == 2, 1, 0), fall = ifelse(season == 3, 1, 0), winter = ifelse(season == 4, 1, 0)) %>% select(-season)
+train <- train %>% mutate(clear_clouds = ifelse(weather == 1, 1, 0), mist = ifelse(weather == 2, 1, 0), lt_precip = ifelse(weather == 3 | weather == 4, 1, 0)) %>% select(-weather)
+```
+
+<br>
+
+#### Standardize continuous variables
+
+This step scales the continuous variables and saves the center and scale information for scaling the test data later. 
+
+```{r new-variables-2}
+temp_train <- scale(train$temp)
+atemp_train <- scale(train$atemp)
+humidity_train <- scale(train$humidity)
+windspeed_train <- scale(train$windspeed)
+train <- train %>% mutate(temp = scale(temp)[,1], atemp = scale(atemp)[,1], humidity = scale(humidity)[,1], windspeed = scale(windspeed)[,1])
+```
+
+Scaling will ensure that none of the fitting processes will overweight one variable due to differences in scale and that no issues with being caused if modeling algorithms involving Euclidean distances are used. 
+
+<br>
+
+### Derived feature design
+
+In this step, new features are added to the data using features already present in the data.
+
+#### Split up the date time information
+
+To separate the information present in the `datetime` feature, the feature is split into its separate parts. In addition, a factor dummy variable to indicate if the day is a weekend is also added.
+
+```{r new-variables-1}
+train <- train %>% mutate(hour = hour(datetime), day = day(datetime), month = month(datetime), year = year(datetime), weekendday = ifelse(wday(datetime) %in% c(1, 7), 1, 0), day_week = wday(datetime)) %>% select(-datetime)
+```
+
+<br>
+
+
+### Checking the distribution of the response variable
+
+Ordinary Least Squares (OLS) Regression assumes a normally distributed response variable. However, this analysis involves a count response variable. Count variables are usually not normally distributed and require an assumption of a Poisson distribution to model correctly.
+```{r}
+ggplot(train, aes(x = count)) + 
+    geom_density() +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Density of `count`", y = "P(`count`)", x = "`count`")
+```
+
+As the density plot shows, the count variable is not normally distributed, thus OLS will not account for the appropriate mean-variance relationships in the data.
+
+<br>
+
+Comparing different models will all the features included allows one to see the different outcomes in using a linear regression versus a Poisson regression. First, a linear model is fit:
+```{r}
+fit_lm <- lm(count ~ temp + atemp + humidity + windspeed + hour + day + month + year + holiday + workingday + spring + summer + winter + clear_clouds + mist + lt_precip + day_week, train)
+```
+
+<br>
+
+Then, a generalized linear model using the Poisson distribution is fit:
+```{r}
+fit_glm <- glm(count ~ temp + atemp + humidity + windspeed + hour + day + month + year + holiday + workingday + spring + summer + winter + clear_clouds + mist + lt_precip + day_week, data = train, family = "poisson")
+summary(fit_glm)
+```
+
+One of the important assumptions of Poisson regression is that the dispersion parameter is about one. If this assumption is violated, the Poisson regression will not adequately provide for overdispersed count data. From the summary of `fit_glm` above, the dispersion parameter, calculated as the Residual Deviance divided by the degrees of freedom (df), is 752090/8147, or 92.3, which is much larger than one. Thus, a Poisson regression does not account for overdispersion in the data and will not model the mean-variance relationships in the data appropriately.
+
+<br>
+
+A negative binomial regression includes an extra parameter, theta, to allow the model to account for overdispersion. The model is fit using the `glm.nb` function from the `MASS` package.
+```{r}
+fit_nb <- glm.nb(count ~ temp + atemp + humidity + windspeed + hour + day + month + year + holiday + workingday + spring + summer + winter + clear_clouds + mist + lt_precip + day_week, data = train)
+summary(fit_nb)
+```
+
+The model assumes a theta of 1.28, yielding a dispersion parameter of 9173.3/8148, or 1.13, which is close to one. A negative binomial regression will adequately account for the mean-variance relationships in the data, as the theta parameter will allow the model to account for the overdispersed `count` variable.
+
+<br>
+
+As a final check, the actual `count` values versus each model's predictions is plotted to compare each model's fit. In addition, the residual versus fitted plots are also included to compare how each model is fitting the data.
+
+```{r fig.width = 12, fig.height = 10}
+resid_lm <- data.frame(act = train$count, pred = predict(fit_lm, type = "response")) %>% mutate(resid = act - pred)
+lm_fit <- ggplot(resid_lm, aes(x = pred, y = act)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    geom_abline(slope=1, intercept=0, col = "black") + 
+    ylim(c(0,800)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Actual vs Fitted Plot of a Linear Regression", y = "Actual", x = "Fitted")
+lm_resid <- ggplot(resid_lm, aes(x = pred, y = resid)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    stat_smooth(method="lm", color = "red", formula = y ~ ns(x,6), se = FALSE) + 
+    geom_hline(yintercept = 0) + ylim(c(-600,600)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Residuals vs Fitted Plot of a Linear Regression", y = "Residuals", x = "Fitted")
+
+resid_glm <- data.frame(act = train$count, pred = predict(fit_glm, type = "response")) %>% mutate(resid = act - pred)
+glm_fit <- ggplot(resid_glm, aes(x = pred, y = act)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    geom_abline(slope=1, intercept=0, col = "black") + 
+    ylim(c(0,800)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Actual vs Fitted Plot of a Poisson Regression", y = "Actual", x = "Fitted")
+glm_resid <- ggplot(resid_glm, aes(x = pred, y = resid)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    stat_smooth(method="lm", color = "red", formula = y ~ ns(x,6), se = FALSE) + 
+    geom_hline(yintercept = 0) + 
+    ylim(c(-600,600)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Residuals vs Fitted Plot of a Poisson Regression", y = "Residuals", x = "Fitted")
+
+resid_nb <- data.frame(act = train$count, pred = predict(fit_nb, type = "response")) %>% mutate(resid = act - pred)
+nb_fit <- ggplot(resid_nb, aes(x = pred, y = act)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    geom_abline(slope=1, intercept=0, col = "black") + 
+    ylim(c(0,800)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Actual vs Fitted Plot of a Negative Binomial Regression", y = "Actual", x = "Fitted")
+nb_resid <- ggplot(resid_nb, aes(x = pred, y = act)) + 
+    geom_point(color = "#0068D6", alpha = 0.6) + 
+    stat_smooth(method="lm", color = "red", formula = y ~ ns(x,6), se = FALSE) + 
+    geom_hline(yintercept = 0) + 
+    ylim(c(-600,600)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Residuals vs Fitted Plot of a Negative Binomial Regression", y = "Residuals", x = "Fitted")
+
+grid.arrange(lm_fit, lm_resid, glm_fit, glm_resid, nb_fit, nb_resid, ncol = 2)
+```
+
+These plots illustrate how each model type fits the mean-variance relationships in the data. With count data, the variance of predictions tends to increase the greater the amount predicted causing a fan shape to appear in the plot. The Linear Regression plots do show this fan shape as there is less variance in the residuals at lower fitted values compared to higher values. There is little bias present in the fit as the residuals are centered around zero. The heteroskedasticity in the data is not horrible, but when compared to the generalized linear regression options, the difference in variability for the glm options are greatly reduced, yielding a model that more appropriately models the variance in the data.
+
+For instance, the Poisson regression and, especially, the negative binomial regression do not show this fan shape as their fitted values increase. The negative binomial regression's variance modeling is very even as the fitted values increased. However, there is a clear negative bias in this model as it consistently underestimates the actual count values. It is important to remember that no model is correct, and it is often up to each modeler's preferences to decide how important a model's prediction bias is to its prediction variance. In this case, since these are not the final model options, the model with the best variance fit will be used going forward as issues with bias could be corrected with better feature engineering and transformations once the proper regression type is assumed. Thus, the negative binomial regression will be used for all modeling going forward.
+
+<br>
+
+### EDA: Transformations for ordinal features
+
+#### Prepare 10-fold Cross Validation data
+
+Exploratory data analysis will be used to tune the features in the data. Thus, a list of ten data folds will be constructed using the custom `klist` function from my K-Fold Cross Validation Helper Functions (https://github.com/cojamalo/K-Fold-CV-Helper-Functions), which creates ten non-overlapping train-test splits of an input data set for use in using cross validation to estimate prediction error.
+
+```{r}
+klist_train <- klist(train)
+```
+
+<br>
+
+#### Tuning the fit for all ordinal features
+
+The new features relating to the time when the bike was rented are plotted versus `count` to check their negative binomial fit: 
+```{r fig.width = 12, fig.height=10}
+registerDoMC() #doMC
+plot_var <- list("hour", "day", "day_week", "month")
+plots <- foreach(i = seq(from = 1, to = length(plot_var), by = 1), .packages = c("MASS"),  .combine='c')  %dopar%
+    {
+    form1 <- as.formula(paste0("count ~ ", plot_var[[i]]))
+    form2 <- as.formula(paste0("count ~ ns(", plot_var[[i]], ",2)")) 
+    form3 <- as.formula(paste0("count ~ ns(", plot_var[[i]], ",3)")) 
+    fit_lm <- glm.nb(form1, train); pred_lm <- predict(fit_lm, type="response")
+    fit_sq <- glm.nb(form2, train); pred_sq <- predict(fit_sq, type="response")
+    fit_cb <- glm.nb(form3, train); pred_cb <- predict(fit_cb, type="response")
+
+    plot <- ggplot(train, aes(x = train[,plot_var[[i]]], y = count)) +
+        geom_point(alpha = 0.2) + 
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_lm), color = "blue", lwd = 1) +
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_sq), color = "red", lwd = 1) +
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_cb), color = "green", lwd = 1) +
+        theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+        labs(title = paste0("Number of Bikes Rented by ", plot_var[[i]]), y = "Count of Bikes Rented", x = plot_var[[i]])
+    return(list(plot))
+    }
+
+grid.arrange(plots[[1]],plots[[2]],plots[[3]], plots[[4]], ncol = 2)
+```
+
+The blue line represents the predicted counts under the negative binomial regression. In addition, two splines are added to compare the basic fit with non-linear fits using cubic splines. In this case, splines with two (red) and three (green) degrees of freedom are shown. 
+
+<br>
+
+#### `hour` feature splitting
+
+It is clear from the plot that as the hour of day increases, the count of bikes varies in a way that is not predicted well by the basic negative binomial fit.
+```{r fig.width=10}
+fit <- glm.nb(count ~ hour, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ hour + ns(hour, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ hour + ns(hour, 12), train); pred_ns <- predict(fit_ns, type="response")
+
+ggplot(train, aes(x = hour, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = hour, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = hour, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = hour, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Hour", y = "Count of Bikes Rented", x = "Hour")
+  
+```
+
+From midnight to around 4 am, bike rentals appear to decrease, then from about 5 am to around 5:30 pm, bike rentals increase, after which they again decrease. The green line in this plot shows a cubic spline with twelve degrees of freedom and how it captures the changing number of bike rentals throughout the day. While a spline could capture much of this non-linear relationship, another alternative is to split the hours into their own features so the regression can fit a model for each hour versus the rest. This is possible to do since the hour variable is discrete, not continuous.
+<br>
+
+The following code creates a dummy variable for each unique hour and fits a model using the new features.
+```{r}
+train <- train %>% mutate(hr_0 = ifelse(hour == 0, 1, 0), hr_1 = ifelse(hour == 1, 1, 0), hr_2 = ifelse(hour == 2, 1, 0), hr_3 = ifelse(hour == 3, 1, 0), hr_4 = ifelse(hour == 4, 1, 0), hr_5 = ifelse(hour == 5, 1, 0), hr_6 = ifelse(hour == 6, 1, 0), hr_7 = ifelse(hour == 7, 1, 0), hr_8 = ifelse(hour == 8, 1, 0), hr_9 = ifelse(hour == 9, 1, 0), hr_10 = ifelse(hour == 10, 1, 0), hr_11 = ifelse(hour == 11, 1, 0), hr_12 = ifelse(hour == 12, 1, 0), hr_13 = ifelse(hour == 13, 1, 0), hr_14 = ifelse(hour == 14, 1, 0), hr_15 = ifelse(hour == 15, 1, 0), hr_16 = ifelse(hour == 16, 1, 0), hr_17 = ifelse(hour == 17, 1, 0), hr_18 = ifelse(hour == 18, 1, 0), hr_19 = ifelse(hour == 19, 1, 0), hr_20 = ifelse(hour == 20, 1, 0), hr_21 = ifelse(hour == 21, 1, 0), hr_22 = ifelse(hour == 22, 1, 0), hr_23 = ifelse(hour == 23, 1, 0))
+
+fit_sep <- glm.nb(count ~ hour + hr_0 + hr_1 + hr_2 + hr_3 + hr_4 + hr_5 + hr_6 + hr_7 + hr_8 + hr_9 + hr_10 + hr_11 + hr_12 + hr_13 + hr_14 + hr_15 + hr_16 + hr_17 + hr_18 + hr_19 + hr_20 + hr_21 + hr_22 + hr_23, train)
+```
+
+<br>
+
+The residual vs fitted plots give a quick comparison between the fits of the original model with just the `hour` and the hour separated model.
+```{r}
+plot(fit, which =1)
+plot(fit_sep, which =1)
+```
+
+The bias and variance issues caused by the non-linear hour-count relationship have been reduced significantly with the separation of the hour variable.
+
+<br>
+
+#### `day` feature check 
+
+Next, the `day` feature is checked.
+```{r fig.width=10}
+fit <- glm.nb(count ~ day, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ ns(day, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ ns(day, 12), train); pred_ns <- predict(fit_ns, type="response")
+
+ggplot(train, aes(x = day, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = day, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = day, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = day, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Day of the Month", y = "Count of Bikes Rented", x = "Day of the Month")
+```
+
+The relationship between `day` of the month and the number of bikes rented is very weak. This feature will remain untouched.
+
+```{r}
+plot(fit, which = 1)
+```
+
+
+<br>
+
+#### `day_week` feature check 
+
+The `day_week` feature is checked.
+```{r fig.width=10}
+fit <- glm.nb(count ~ day_week, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ ns(day_week, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ ns(day_week, 6), train); pred_ns <- predict(fit_ns, type="response")
+
+ggplot(train, aes(x = day_week, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = day_week, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = day_week, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = day_week, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Day of the Week", y = "Count of Bikes Rented", x = "Day of the Week")
+```
+
+The relationship between `day_week` of the month and the number of bikes rented is very weak. This feature will remain untouched.
+
+<br>
+
+```{r}
+plot(fit, which = 1)
+```
+
+#### `month` feature check 
+
+Finally, the `month` feature is checked to ensure it is ready for modeling.
+
+```{r fig.width=10}
+fit <- glm.nb(count ~ month, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ month + ns(month, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ month + ns(month, 2), train); pred_ns <- predict(fit_ns, type="response")
+
+ggplot(train, aes(x = month, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = month, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = month, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = month, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Month", y = "Count of Bikes Rented", x = "Month")
+```
+
+From this plot, it appears there is a relationship between which month bikes are rented in and how many bikes are rented. The spline with two degrees of freedom captures this relationship well as more bikes are rented in the summer months than the winter months.
+
+<br>
+
+To ensure the spline with two degrees of freedom does result in the best predictions, an optimization check for degrees of freedom is conducted. Splines of differing degrees of freedom as fitted and a root mean squared error (RMSE) estimate is taken for the resulting model using a 10-Fold Cross Validation for the training data. 
+```{r mth-ns, results="asis"}
+registerDoMC() #doMC
+rmses <- foreach(i = seq(from = 1, to = 6, by = 1), .packages = c("MASS"),  .combine='c')  %dopar%
+    {
+    eval <- colMeans(validate_glm_nb(klist_train, count ~ month + ns(month, i)))
+    return(eval)
+    }
+
+output <- data.frame(df = seq(from = 1, to = 6, by = 1), KFOLD_RMSE = NA)
+output$KFOLD_RMSE <- rmses
+pandoc.table(output)
+ggplot(output, aes(x = df, y = KFOLD_RMSE)) + geom_point() + 
+    geom_vline(xintercept = 2) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "10-FOLD RMSE Estimate by df of `month` Spline", y = "10-FOLD RMSE Estimate", x = "Degrees of Freedom of Spline")
+```
+
+There is clearly a large reduction in prediction error for a spline with two degrees of freedom. Any additional degrees of freedom do not significantly reduce error, so a two df spline is selected.
+
+<br>
+
+The residual versus fitted plots are compared to view the results of the added spline:
+```{r}
+plot(fit, which =1)
+plot(fit_ns, which =1)
+```
+
+The model including the 2 df spline has less variation in bias than the model excluding the spline, so the spline will be included in future models.
+
+<br>
+
+### EDA: Transformations for continous variables
+
+Now that all the discrete and factor variables have been addressed, the remaining continuous variables must be checked.
+
+```{r fig.width = 12, fig.height= 10}
+registerDoMC() #doMC
+plot_var <- list("temp", "atemp", "humidity", "windspeed")
+plots <- foreach(i = seq(from = 1, to = 4, by = 1), .packages = c("MASS"),  .combine='c')  %dopar%
+    {
+    form1 <- as.formula(paste0("count ~ ", plot_var[[i]]))
+    form2 <- as.formula(paste0("count ~ ns(", plot_var[[i]], ",2)")) 
+    form3 <- as.formula(paste0("count ~ ns(", plot_var[[i]], ",3)")) 
+    fit_lm <- glm.nb(form1, train); pred_lm <- predict(fit_lm, type="response")
+    fit_sq <- glm.nb(form2, train); pred_sq <- predict(fit_sq, type="response")
+    fit_cb <- glm.nb(form3, train); pred_cb <- predict(fit_cb, type="response")
+
+    plot <- ggplot(train, aes(x = train[,plot_var[[i]]], y = count)) +
+        geom_point(alpha = 0.2) + 
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_lm), color = "blue", lwd = 1) +
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_sq), color = "red", lwd = 1) +
+        geom_line(aes(x = train[,plot_var[[i]]], y = pred_cb), color = "green", lwd = 1) +
+        theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+        labs(title = paste0("Number of Bikes Rented by ", plot_var[[i]]), y = "Count of Bikes Rented", x = plot_var[[i]])
+    return(list(plot))
+    }
+
+grid.arrange(plots[[1]],plots[[2]],plots[[3]],plots[[4]], ncol = 2)
+```
+The blue line represents the predicted counts under the negative binomial regression. In addition, two splines are added to compare the basic fit with non-linear fits using cubic splines. In this case, splines with two (red) and three (green) degrees of freedom are shown. 
+
+
+#### `temp` feature check
+
+The first variable to check is `temp`.
+
+```{r fig.width=10}
+fit <- glm.nb(count ~ temp, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ temp + ns(temp, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ temp + ns(temp, 3), train); pred_ns <- predict(fit_ns, type="response")
+
+scatter <- ggplot(train, aes(x = temp, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = temp, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = temp, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = temp, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Scaled Temperature", y = "Count of Bikes Rented", x = "Scaled Temperature")
+
+density <- ggplot(train, aes(x = temp)) + 
+    geom_density(fill = "black",color = "black", alpha = 0.6)  +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Density of Scaled Temperature", y = "P(Scaled Temperature)", x = "Scaled Temperature")
+
+grid.arrange(scatter, density, ncol = 2)
+```
+
+A scatterplot and density plot are included to evaluate the relationship between `temp` and `count`. In this case, the simple negative binomial regression appears to fit the data well.
+
+<br>
+
+A quick check of the residual versus fitted plot confirms this assessment as the residual variance and bias is acceptable.
+```{r}
+plot(fit, which = 1)
+```
+
+<br>
+
+#### `atemp` feature check
+
+Hypothetically, `atemp` should have a similar relationship to `count` as `temp`.
+```{r fig.width=10}
+fit <- glm.nb(count ~ atemp, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ ns(atemp, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ ns(atemp, 7), train); pred_ns <- predict(fit_ns, type="response")
+
+scatter <- ggplot(train, aes(x = atemp, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = atemp, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = atemp, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = atemp, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Scaled Aparent Temp", y = "Count of Bikes Rented", x = "Scaled Aparent Temp")
+
+density <- ggplot(train, aes(x = atemp)) + 
+    geom_density(fill = "black",color = "black", alpha = 0.6) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Density of Scaled Aparent Temperature", y = "P(Scaled Aparent Temp)", x = "Scaled Aparent Temp")
+ 
+grid.arrange(scatter, density,ncol = 2)
+```
+
+Again, the simple negative binomial regression appears to fit best.
+
+<br>
+
+A quick check of the residual versus fitted plot confirms this assessment as the residual variance and bias is acceptable.
+
+```{r}
+plot(fit, which = 1)
+```
+
+<br>
+
+#### `humidity` feature check
+
+The next feature variable is `humidity`.
+
+```{r fig.width=10}
+fit <- glm.nb(count ~ humidity, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ humidity + ns(humidity, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ humidity + ns(humidity, 3), train); pred_ns <- predict(fit_ns, type="response")
+
+scatter <- ggplot(train, aes(x = humidity, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = humidity, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = humidity, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = humidity, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Scaled Humidity", y = "Count of Bikes Rented", x = "Scaled Humidity")
+
+density <- ggplot(train, aes(x = humidity)) + 
+    geom_density(fill = "black",color = "black", alpha = 0.6) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Density of Scaled Humidity", y = "P(Scaled Humidity)", x = "Scaled Humidity")
+ 
+grid.arrange(scatter, density,ncol = 2)
+```
+
+It is unclear why there is a grouping of low counts at the minimum humidity values. Otherwise, the 2 df spline appears to fit the data well.
+
+<br>
+
+To ensure the spline with two degrees of freedom does result in the best predictions, an optimization check for degrees of freedom is conducted. Splines of differing degrees of freedom as fitted and a root mean squared error (RMSE) estimate is taken for the resulting model using a 10-Fold Cross Validation for the training data. 
+```{r humid-ns, results="asis", cache = TRUE}
+registerDoMC() #doMC
+rmses <- foreach(i = seq(from = 1, to = 6, by = 1), .packages = c("MASS"),  .combine='c')  %dopar%
+    {
+    eval <- colMeans(validate_glm_nb(klist_train, count ~ ns(humidity, i)))
+    return(eval)
+    }
+
+output <- data.frame(df = seq(from = 1, to = 6, by = 1), KFOLD_RMSE = NA)
+output$KFOLD_RMSE <- rmses
+pandoc.table(output)
+ggplot(output, aes(x = df, y = KFOLD_RMSE)) + 
+    geom_point() + 
+    geom_vline(xintercept = 2) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "10-FOLD RMSE Estimate by df of `humidity` Spline", y = "10-FOLD RMSE Estimate", x = "Degrees of Freedom of Spline")
+```
+
+There is a significant improvement in RMSE with the 2 df spline included.
+
+<br>
+
+Finally, the residual vs fitted plot is checked. 
+```{r}
+plot(fit, which = 1)
+plot(fit_lo, which = 1)
+```
+
+The residuals for the 2 df spline exhibit better bias and variance than the original fit.
+
+<br>
+
+#### `windspeed` feature tuning with splines
+
+Finally, the windspeed variable is checked.
+```{r fig.width=10}
+fit <- glm.nb(count ~ windspeed, train); pred <- predict(fit, type="response")
+fit_lo <- glm.nb(count ~ windspeed + ns(windspeed, 2), train); pred_lo <- predict(fit_lo, type="response")
+fit_ns <- glm.nb(count ~ windspeed + ns(windspeed, 3), train); pred_ns <- predict(fit_ns, type="response")
+
+scatter <- ggplot(train, aes(x = windspeed, y = count)) +
+    geom_point(alpha = 0.2) + 
+    geom_line(aes(x = windspeed, y = pred), color = "blue", lwd = 1) +
+    geom_line(aes(x = windspeed, y = pred_lo), color = "red", lwd = 1) +
+    geom_line(aes(x = windspeed, y = pred_ns), color = "green", lwd = 1) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Number of Bikes Rented by Scaled Windspeed", y = "Count of Bikes Rented", x = "Scaled Windspeed")
+
+density <- ggplot(train, aes(x = windspeed)) + 
+    geom_density(fill = "black",color = "black", alpha = 0.6) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Density of Scaled Windspeed", y = "P(Scaled Windspeed)", x = "Scaled Windspeed")
+ 
+grid.arrange(scatter, density,ncol = 2)
+```
+
+Again, the 2 df spline appears to fit the data well.
+
+<br>
+
+To ensure the spline with two degrees of freedom does result in the best predictions, an optimization check for degrees of freedom is conducted. Splines of differing degrees of freedom as fitted and a root mean squared error (RMSE) estimate is taken for the resulting model using a 10-Fold Cross Validation for the training data. 
+```{r wind-ns, results="asis", cache = TRUE}
+registerDoMC() #doMC
+rmses <- foreach(i = seq(from = 1, to = 6, by = 1), .packages = c("MASS"),  .combine='c')  %dopar%
+    {
+    eval <- colMeans(validate_glm_nb(klist_train, count ~ windspeed + ns(windspeed, i)))
+    return(eval)
+    }
+
+output <- data.frame(df = seq(from = 1, to = 6, by = 1), KFOLD_RMSE = NA)
+output$KFOLD_RMSE <- rmses
+pandoc.table(output)
+ggplot(output, aes(x = df, y = KFOLD_RMSE)) + 
+    geom_point() + 
+    geom_vline(xintercept = 2) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "10-FOLD RMSE Estimate by df of `windspeed` Spline", y = "10-FOLD RMSE Estimate", x = "Degrees of Freedom of Spline")
+```
+
+There is a significant improvement in RMSE with the 2 df spline included.
+
+<br>
+
+Finally, the residual vs fitted plot is checked. 
+```{r}
+klist_train <- klist(train)
+plot(fit, which = 1)
+plot(fit_lo, which = 1)
+```
+
+The residuals for the 2 df spline exhibit better bias and variance than the original fit. 
+
+<br>
+
+## Apply to test set
+Before selecting for the best features, all changes made to the training data set are applied to the testing data set.
+```{r}
+# Apply all variable transformations to the test set
+test <- test %>% select(-registered, -casual)
+test$datetime <- ymd_hms(test$datetime)
+test <- test %>% mutate(spring = ifelse(season == 1, 1, 0), summer = ifelse(season == 2, 1, 0), fall = ifelse(season == 3, 1, 0), winter = ifelse(season == 4, 1, 0)) %>% select(-season)
+test <- test %>% mutate(clear_clouds = ifelse(weather == 1, 1, 0), mist = ifelse(weather == 2, 1, 0), lt_precip = ifelse(weather == 3 | weather == 4, 1, 0)) %>% select(-weather)
+test <- test %>% mutate(hour = hour(datetime), day = day(datetime), month = month(datetime), year = year(datetime), weekendday = ifelse(wday(datetime) %in% c(1, 7), 1, 0), day_week = wday(datetime)) %>% select(-datetime)
+test <- test %>% mutate(hr_0 = ifelse(hour == 0, 1, 0), hr_1 = ifelse(hour == 1, 1, 0), hr_2 = ifelse(hour == 2, 1, 0), hr_3 = ifelse(hour == 3, 1, 0), hr_4 = ifelse(hour == 4, 1, 0), hr_5 = ifelse(hour == 5, 1, 0), hr_6 = ifelse(hour == 6, 1, 0), hr_7 = ifelse(hour == 7, 1, 0), hr_8 = ifelse(hour == 8, 1, 0), hr_9 = ifelse(hour == 9, 1, 0), hr_10 = ifelse(hour == 10, 1, 0), hr_11 = ifelse(hour == 11, 1, 0), hr_12 = ifelse(hour == 12, 1, 0), hr_13 = ifelse(hour == 13, 1, 0), hr_14 = ifelse(hour == 14, 1, 0), hr_15 = ifelse(hour == 15, 1, 0), hr_16 = ifelse(hour == 16, 1, 0), hr_17 = ifelse(hour == 17, 1, 0), hr_18 = ifelse(hour == 18, 1, 0), hr_19 = ifelse(hour == 19, 1, 0), hr_20 = ifelse(hour == 20, 1, 0), hr_21 = ifelse(hour == 21, 1, 0), hr_22 = ifelse(hour == 22, 1, 0), hr_23 = ifelse(hour == 23, 1, 0))
+
+test <- test %>% mutate(temp = scale(temp, attr(temp_train, "scaled:center"),attr(temp_train, "scaled:scale"))[,1], atemp = scale(atemp, attr(atemp_train, "scaled:center"),attr(atemp_train, "scaled:scale"))[,1], humidity = scale(humidity, attr(humidity_train, "scaled:center"),attr(humidity_train, "scaled:scale"))[,1], windspeed = scale(windspeed, attr(windspeed_train, "scaled:center"),attr(windspeed_train, "scaled:scale"))[,1])
+```
+
+* * *
+
+## Part 4: Feature Selection
+
+First, the training data set is checked for any variables that have near zero variance.
+```{r}
+names(train)[nearZeroVar(train)]
+table(train$holiday)
+```
+
+The `holiday` variable and individual hour variables have low variance, but they each have enough representation in each category to keep them included in the data set.
+
+<br>
+
+### Basic Multiple Regression
+
+The first model fit is the negative binomial model with all features included.
+```{r single-linear-model}
+fit1 <- glm.nb(count ~ . + ns(month, 2) + ns(humidity, 2) + ns(windspeed,2), train)
+summary(fit1)
+```
+
+<br>
+
+To assess the prediction error of this model, the RMSE is calculated using the custom cross validation functions from my K-Fold Cross Validation Helper Functions, which creates ten non-overlapping train-test splits of an input data set for use in using cross validation to estimate prediction error.
+
+
+```{r cache=TRUE}
+rmse_basic <- colMeans(validate_glm_nb(klist_train, count ~ . + ns(month, 2) + ns(humidity, 2) + ns(windspeed,2))) # 100
+```
+
+This model has an estimated RMSE of 100 bikes.
+
+<br>
+
+### Greedy forward-step selection for 10-fold RMSE
+
+The first feature selection strategy is used is a greedy forward-step selection where the features are added one at a time and the feature that lowers the RMSE the most at each step is selected and the then the process is rerun until adding more features no longer lowers the RMSE.
+
+```{r cache=TRUE, results="asis"}
+test_val <- function(formula) {
+    fit <- glm.nb(as.formula(formula), train)
+    pred <- predict(fit, test, type = "response")
+    resid <- test$count - pred
+    return(sqrt(mean(resid^2)))
+}
+
+one_step <- function(base_function, data) {
+    # RMSE
+    RMSE <- colMeans(validate_glm_nb(klist_train, as.formula(base_function)))
+    # Extract variables from the formula
+    params <- trimws(strsplit(base_function, split = "~")[[1]])
+    # Construct base vector from the formula 
+    base <- params[2]
+    if (grepl("[+]", params[2])) {
+        base <- trimws(strsplit(params[2], split = "[+]")[[1]])     
+    }
+    predictors <- length(base)
+    test_RMSE <- test_val(base_function)
+    output <- data.frame(model = base_function, terms = predictors, RMSE = RMSE, test_RMSE = test_RMSE) 
+
+    # extract response variable
+    variables <- names(data)
+    variables <- variables[!grepl(params[1], variables)]
+    variables <- c(variables, "ns(month, 2)", "ns(humidity, 2)", "ns(windspeed,2)")
+
+    # Construct expand_args from base
+    expand_args <- c()
+    for (item in base) {
+        expand_args <- c(expand_args, list(item))
+    }
+    expand_args <- c(expand_args, list(variables))
+    # Construct the combination data frame
+    current <- expand.grid(expand_args, stringsAsFactors = FALSE)
+    # This checks for any rows that are duplicates of each other:
+    duplicates <- duplicated(apply(apply( current, 1, sort), 2 , paste , collapse = ""))
+    current <- current[!duplicates,]
+    # This removes any rows with the same variable in more than one column
+    key <- colSums(apply(apply( current, 1, as.character), 2 , duplicated))
+    current <- current[key == 0,] 
+    # Construct formulas vector   
+    formulas <- apply(current, 1 , paste , collapse = " + ")    
+    formulas <- paste0(params[1], " ~ ", formulas)
+    # Runs validate for each string of a vector of formula strings
+    registerDoMC() #doMC
+    new <- foreach(i = seq(from = 1, to = length(formulas), by = 1), .packages = c("MASS"),  .combine='rbind')  %dopar%
+         {
+            RMSE <- colMeans(validate_glm_nb(klist_train, as.formula(formulas[i])))
+            # Extract variables from the formula
+            params <- trimws(strsplit(formulas[i], split = "~")[[1]])
+            # Construct base vector from the formula 
+            base <- params[2]
+            if (grepl("[+]", params[2])) {
+                base <- trimws(strsplit(params[2], split = "[+]")[[1]])     
+            }
+            predictors <- length(base)
+            test_RMSE <- test_val(formulas[i])
+            output <- data.frame(model = formulas[i], terms = predictors, RMSE = RMSE, test_RMSE = test_RMSE)
+        return(output[1,])
+        }
+
+        output <- rbind(output, new) %>% arrange(RMSE)
+        return(output)
+} 
+
+previous_best_formula <- "count ~ 1"
+run <- one_step(previous_best_formula, train)
+runs <- run
+new_score <- run$RMSE - 1
+best_score <- run$RMSE
+while (new_score < best_score) {
+    best_score <- new_score
+    best_formula <- run$model
+    run <- one_step(as.character(best_formula), train)
+    new_score <- run$RMSE
+    runs <- rbind(runs, run)
+}
+results <- runs %>% group_by(terms) %>% top_n(1) %>% arrange(RMSE) %>% select(-test_RMSE)
+pandoc.table(results)
+```
+
+The formula with 30 terms appears to lower the RMSE the most, but after about 22 terms, the RMSE drops much more slowly. 
+
+<br>
+
+This relationship can be plotted with a scatterplot of RMSE versus the best formula for each number of features:
+```{r}
+ggplot(results, aes(x = terms, y = RMSE)) + 
+    geom_point() + 
+    geom_vline(xintercept = 30, color = "red") + 
+    geom_vline(xintercept = 22, color = "blue") +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "RMSE Estimate by Number of Features", y = "RMSE Estimate", x = "Number of features in formula")
+```
+
+An elbow of this plot at 22 is marked with a blue vertical line and the model with the best RMSE is marked with a red vertical line. 
+
+<br>
+
+To avoid overfitting, both models will be considered as overfitting often occurs if only the best RMSE estimate for the training data is chosen.
+
+```{r results ="asis"}
+rmse_greedy_error <- colMeans(validate_glm_nb(klist_train, count ~ atemp + hr_17 + hr_18 + year + ns(humidity, 2) + winter + hr_8 + hr_4 + hr_3 + hr_2 + hr_5 + hr_1 + hr_0 + hr_19 + spring + hr_6 + hr_23 + hr_16 + hr_22 + lt_precip +  hr_10 + hr_21 + hr_11 +  ns(month, 2) + summer + day +  day_week + mist + workingday)) # 98.9
+
+rmse_greedy_elbow <- colMeans(validate_glm_nb(klist_train, count ~ atemp + hr_17 + hr_18 + year + ns(humidity, 2) + winter + hr_8 + hr_4 + hr_3 + hr_2 + hr_5 + hr_1 + hr_0 + hr_19 + spring + hr_6 + hr_23 + hr_16 + hr_22 + lt_precip + weekendday)) # 102
+```
+These models have an estimated RMSE of 102 bikes for the elbow model with 22 features and 98.9 for the best model with 30 features.
+
+<br>
+
+Finally, both models are fit to compare later.
+```{r}
+fit_gr_elb <- glm.nb(count ~ atemp + hr_17 + hr_18 + year + ns(humidity, 2) + winter + hr_8 + hr_4 + hr_3 + hr_2 + hr_5 + hr_1 + hr_0 + hr_19 + spring + hr_6 + hr_23 + hr_16 + hr_22 + lt_precip + weekendday, train)
+fit_gr <- glm.nb(count ~ atemp + hr_17 + hr_18 + year + ns(humidity, 2) + winter + hr_8 + hr_4 + hr_3 + hr_2 + hr_5 + hr_1 + hr_0 + hr_19 + spring + hr_6 + hr_23 + hr_16 + hr_22 + lt_precip +  hr_10 + hr_21 + hr_11 +  ns(month, 2) + summer + day +  day_week + mist + workingday, train)
+```
+
+
+<br>
+
+### PCA Regression
+
+The final modeling technique included in this analysis is to preprocess the data with principal components analysis (PCA). PCA requires a threshold value for the amount of variability to capture. Thus, an estimation of RMSE will be used to find the best threshold.
+
+```{r pca-thresh-tests, cache = TRUE, results = "asis"}
+train_pca_dat <- cbind(train, ns(train$month, 2)[,],ns(train$humidity, 2)[,], ns(train$windspeed, 2)[,])
+
+registerDoMC()
+rmses <- foreach(i = seq(from = 0.90, to = 0.99, by = 0.01), .packages = c("caret", "MASS"),  .combine='c')  %dopar%
+    {
+    # Create preProcess object using pca method with threshold for variance
+    train_pca <- preProcess(train_pca_dat, method = "pca", thresh = i)
+    # Create the new dataset with pca variables from the preProcess object
+    train_pca <- predict(train_pca, train_pca_dat)
+    # Add the data you want to predict from training set
+    train_pca$count <- train_pca_dat$count
+    klist_pca <- klist(train_pca)
+    eval_pca <- colMeans(validate_glm_nb(klist_pca, count ~ .))
+    return(eval_pca)
+    }
+
+output <- data.frame(thresh = seq(from = 0.90, to = 0.99, by = 0.01), KFOLD_RMSE = NA)
+output$KFOLD_RMSE <- rmses
+pandoc.table(output)
+ggplot(output, aes(x = thresh, y = KFOLD_RMSE)) + 
+    geom_point() + 
+    geom_vline(xintercept = 0.97) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "RMSE Estimate by PCA Threshold", y = "RMSE Estimate", x = "PCA Threshold")
+```
+
+A threshold of 0.97 yields the lowest RMSE value.
+
+<br>
+
+The final PCA is run and RMSE estimated.
+```{r}
+# Create preProcess object using pca method
+train_pca_r <- preProcess(train_pca_dat, method = "pca", thresh = 0.97)
+# Create the new dataset with pca variables from the preProcess object
+train_pca <- predict(train_pca_r, train_pca_dat)
+# Add the data you want to predict from training set
+train_pca$count <- train_pca_dat$count
+klist_pca <- klist(train_pca)
+rmse_pca_glm <- colMeans(validate_glm_nb(klist_pca, count ~ ., parallel = TRUE)) #98.1
+```
+This model has an estimated RMSE of 98.1 bikes.
+
+<br>
+The PCA model is fit:
+
+```{r}
+fit_pca_glm <- glm.nb(count ~ ., train_pca)
+```
+
+### Final Options
+
+The compare the four models to select the best option, the models will be validated by the test samples and the RMSE calculated for the out-of-sample predictions.
+```{r}
+## Basic
+pred1 <- predict(fit1, test, type = "response")
+resid1 <- test$count - pred1
+rmse_test_basic <- sqrt(mean(resid1^2))
+
+## PCA glm
+test_pca_dat <- cbind(test, ns(test$month, 2)[,], ns(test$humidity, 2)[,], ns(test$windspeed, 2)[,])
+test_pca <- predict(train_pca_r, test_pca_dat)
+test_pca$count <- test$count
+pred2 <- predict(fit_pca_glm, test_pca, type = "response")
+resid2 <- test$count - pred2
+rmse_test_pca_glm <- sqrt(mean(resid2^2))
+
+## Greedy Elbow
+pred3 <- predict(fit_gr_elb, test, type = "response")
+resid3 <- test$count - pred3
+rmse_test_gr_elb <- sqrt(mean(resid3^2))
+
+## Greedy Error
+pred4 <- predict(fit_gr, test, type = "response")
+resid4 <- test$count - pred4
+rmse_test_gr <- sqrt(mean(resid4^2))
+```
+
+The top two models for out-of-sample RMSE are the PCA model with an RMSE of 96.89 bikes and the best model from the greedy forward-step selection process with an RMSE of 100.05 bikes.
+
+<br>
+
+Now that the models are being compared according to out-of-sample RMSEs, the results from the greedy forward-step analysis with the out-of-sample RMSE can be considered.
+
+```{r cache=TRUE, results = "asis"}
+results <- runs %>% group_by(terms) %>% top_n(1) %>% mutate(mean_RMSE = (RMSE + test_RMSE) / 2) %>% arrange(mean_RMSE) 
+pandoc.table(head(results, 2))
+```
+
+Now, the model with 29 features has the lowest average within-sample and out-of-sample RMSE values.
+
+<br>
+
+The relationship between the number of features and the out-of-sample RMSE is plotted below:
+
+```{r}
+ggplot(results, aes(x = terms, y = RMSE)) + 
+    geom_point() + 
+    geom_point(aes(y = test_RMSE), color = "blue") + 
+    geom_vline(xintercept = 29, color = "red") + 
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "RMSE Estimate by Number of Features", y = "RMSE Estimate", x = "Number of features")
+fit_gr <- glm.nb(count ~ atemp + hr_17 + hr_18 + year + ns(humidity, 2) + winter + hr_8 + hr_4 + hr_3 + hr_2 + hr_5 + hr_1 + hr_0 +  hr_19 + spring + hr_6 + hr_23 + hr_16 + hr_22 + lt_precip + hr_10 + hr_21 + hr_11 + ns(month, 2) + summer + day + day_week + workingday, train)
+pred4 <- predict(fit_gr, test, type = "response")
+resid4 <- test$count - pred4
+rmse_test_gr <- sqrt(mean(resid4^2))
+```
+
+The blue dots represent the out-of-sample RMSE and the black dot is the within-sample RMSE. At 29 features the two errors are the lowest on average. Above 29 features, the two errors begin to diverge.
+
+<br>
+
+### Residual Analysis
+
+To make the final model selection, the actual `count` values versus each model's predictions are plotted to compare each model's fit. In addition, the residual versus fitted plots are also included to compare how each model is fitting the data.  
+```{r fig.width = 12, fig.height = 10}
+pred_train_pca <- predict(fit_pca_glm, type = "response")
+resid_train_pca <- train$count - pred_train_pca
+pca_fit <- ggplot(test, aes(x = pred2, y = count)) + 
+    geom_point(data=train, aes(x = pred_train_pca, y = count), alpha = 0.4, color = "#00BFC4") + 
+    geom_point(col = "#F8766D", alpha = 0.4) + 
+    geom_abline(slope=1, intercept=0, col = "black") + 
+    ylim(c(0,1000)) + 
+    xlim(c(0,1500)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Actual vs Fitted Plot of the PCA Model", y = "Actual", x = "Fitted")
+pca_resid <- ggplot(test, aes(x = pred2, y = resid2)) + 
+    geom_point(data = train, aes(x = pred_train_pca, y = resid_train_pca), color = "#00BFC4", alpha = 0.4) + 
+    stat_smooth(method="lm", color = "red", formula = y ~ ns(x,6), se = FALSE) + 
+    geom_point(col = "#F8766D", alpha = 0.4) + 
+    geom_hline(yintercept = 0) + 
+    ylim(c(-600,600)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Residuals vs Fitted Plot of the PCA Model", y = "Residuals", x = "Fitted")
+
+pred_train <- predict(fit_gr, type = "response")
+resid_train <- train$count - pred_train
+gr_fit <- ggplot(test, aes(x = pred4, y = count)) + 
+    geom_point(data= train, aes(x = pred_train, y = count), alpha = 0.4, color = "#00BFC4") + 
+    geom_point(col = "#F8766D", alpha = 0.4) + 
+    geom_abline(slope=1, intercept=0) + 
+    ylim(c(0,1000)) + 
+    xlim(c(0,1500)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Actual vs Fitted Plot of Best Greedy Model", y = "Actual", x = "Fitted")
+gr_resid <- ggplot(test, aes(x = pred4, y = resid4)) + 
+    geom_point(data = train, aes(x = pred_train, y = resid_train), color = "#00BFC4", alpha = 0.4) + 
+    stat_smooth(method="lm", color = "red", formula = y ~ ns(x,6), se = FALSE) + 
+    geom_point(col = "#F8766D", alpha = 0.4) + geom_hline(yintercept = 0) + 
+    ylim(c(-600,600)) + 
+    xlim(c(0, 800)) +
+    theme(legend.position=c(0.2, 0.8), plot.title = element_text(hjust = 0.5)) +
+    labs(title = "Residuals vs Fitted Plot of Best Greedy Model", y = "Residuals", x = "Fitted")
+
+grid.arrange(pca_fit, pca_resid, gr_fit, gr_resid, ncol = 2)
+```
+
+In this plot, the within-sample predictions are plotted in turquoise and the out-of-sample predictions are plotted in red. Both models have similar distributions of residuals for both prediction types signifying that the models having external validity for use in predicting new data.
+
+In terms of each plots bias and variance, the PCA model has superior bias and variance. The residuals for the PCA model have more even variance as the value of the predicted counts increases. Moreover, for predicted counts of less than 500 bikes, the model has little bias. However, above 500 predicted bikes, the model tends to overestimate the number of bikes rented, with consistent variance. The greedy model, on the other hand, is very heteroscedastic and variance increases greatly as the predicted counts increases. 
+
+<br>
+
+To get a sense of the residual distribution of both models, summary statistic as calculated for the residuals:
+
+```{r results = "asis"}
+## PCA
+test_pca_dat <- cbind(test, ns(test$hour, 12)[,], ns(test$month, 2)[,], ns(test$temp, 7)[,], ns(test$atemp, 7)[,],ns(test$humidity, 2)[,], ns(test$windspeed, 2)[,])
+test_pca <- predict(train_pca_r, test_pca_dat)
+test_pca$count <- test$count
+pred3 <- predict(fit_pca_glm, test_pca, type = "response")
+resid3 <- test$count - pred3
+rmse_test_pca <- sqrt(mean(resid3^2))
+
+
+# Summary table of n, mean, and variance by factor group
+sum_table <- as.data.frame(resid3) %>% summarize(Q1 = quantile(resid3, 0.25), MEDIAN = median(resid3), MEAN = mean(resid3), Q3 = quantile(resid3, 0.75), IQR = IQR(resid3), STDEV = sd(resid3)) %>%
+    mutate(SKEW = ifelse(MEAN > MEDIAN, "RIGHT", "LEFT"))
+
+pandoc.table(sum_table)
+```
+
+For the PCA model, the average error is -0.92 bikes with a standard deviation of 86 bikes. 
+
+<br>
+
+For contrast, the greedy model's summary statistics are calculated.
+```{r results = "asis"}
+# Summary table of n, mean, and variance by factor group
+sum_table <- as.data.frame(resid4) %>% summarize(Q1 = quantile(resid4, 0.25), MEDIAN = median(resid4), MEAN = mean(resid4), Q3 = quantile(resid4, 0.75), IQR = IQR(resid4), STDEV = sd(resid4)) %>%
+    mutate(SKEW = ifelse(MEAN > MEDIAN, "RIGHT", "LEFT"))
+
+pandoc.table(sum_table)
+```
+
+The greedy model's mean residual is farther from zero than the PCA model and the standard deviation is larger for the greedy model at 99.88 bikes.
+
+<br>
+
+The residuals are plotted side by side to compare them visually.
+
+```{r, fig.width=10}
+box_pca <- ggplot(as.data.frame(resid3),aes(x = 1, y = resid3)) + geom_boxplot() + ylim(c(-500,500))
+den_pca <- ggplot(as.data.frame(resid3),aes(x = resid3)) + geom_density() + coord_flip() + xlim(c(-500,500))
+box_gr <-ggplot(as.data.frame(resid4),aes(x = 1, y = resid4)) + geom_boxplot() + ylim(c(-500,500))
+den_gr <-ggplot(as.data.frame(resid4),aes(x = resid4)) + geom_density() + coord_flip() + xlim(c(-500,500))
+grid.arrange(box_pca,den_pca, box_gr, den_gr, ncol = 4)
+```
+
+The plots show a smaller variance in residuals for the PCA model which demonstrates its lower error. 
+
+* * *
+
+## Part 6: Conclusion
+
+Since the PCA model has a better distribution of residuals and smaller residuals on average, it is selected as the final model. It achieves a within-sample RMSE of 98.1 bikes and an out-of-sample RMSE of 96.9 bikes. This error rate is smaller than the naive linear model error rate of 147.8 bikes, and reduction in prediction error of about 35%. One issue that remains with this model is its overestimation of counts at high counts. Specifically, anyone using this model would have to be more skeptical when bike rental count predictions are above 500 bikes as the higher the prediction, the more likely the prediction will overestimate the true count.
+
+While the PCA model is indeed an improved model over a naive linear model, other modeling techniques such as random forests and boosting could likely achieve better prediction accuracy. 

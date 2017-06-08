@@ -1,0 +1,14 @@
+base
+data.table
+pander
+ggplot2
+GGally
+gridExtra
+lubridate
+foreach
+iterators
+doMC
+MASS
+lattice
+caret
+dplyr
